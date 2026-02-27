@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - nem-price-data:/data
+
+volumes:
+  nem-price-data:
