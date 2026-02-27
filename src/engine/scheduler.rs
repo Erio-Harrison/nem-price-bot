@@ -22,44 +22,34 @@ pub async fn run(db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
     fetch_prices(&client, &db, &bot, admin_chat_id).await;
     forecast_fetch(&client, &db, &bot, admin_chat_id).await;
 
-    // Spawn aligned price fetcher
-    {
-        let c = client.clone();
-        let d = db.clone();
-        let b = bot.clone();
-        tokio::spawn(async move { price_fetch_loop(c, d, b, admin_chat_id).await });
-    }
-
-    // Spawn aligned forecast fetcher
-    {
-        let c = client.clone();
-        let d = db.clone();
-        let b = bot.clone();
-        tokio::spawn(async move { forecast_fetch_loop(c, d, b, admin_chat_id).await });
-    }
-
-    // Daily summary + DB cleanup loop
-    let mut summary_check = tokio::time::interval(Duration::from_secs(60));
-    let mut cleanup_interval = tokio::time::interval(Duration::from_secs(86400));
+    // Prices every 60s, forecasts every 5min, cleanup daily
+    let mut price_tick = tokio::time::interval(Duration::from_secs(60));
+    let mut forecast_tick = tokio::time::interval(Duration::from_secs(300));
+    let mut cleanup_tick = tokio::time::interval(Duration::from_secs(86400));
     let mut summary_sent_today = false;
 
-    summary_check.tick().await;
-    cleanup_interval.tick().await;
+    price_tick.tick().await;
+    forecast_tick.tick().await;
+    cleanup_tick.tick().await;
 
     loop {
         tokio::select! {
-            _ = summary_check.tick() => {
+            _ = price_tick.tick() => {
+                fetch_prices(&client, &db, &bot, admin_chat_id).await;
+                // Check daily summary (piggyback on 60s tick)
                 let now_aest = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
-                let hour = now_aest.hour();
-                if hour == 21 && !summary_sent_today {
+                if now_aest.hour() == 21 && !summary_sent_today {
                     summary_sent_today = true;
                     handle_daily_summary(&client, &db, &bot).await;
                 }
-                if hour == 0 {
+                if now_aest.hour() == 0 {
                     summary_sent_today = false;
                 }
             }
-            _ = cleanup_interval.tick() => {
+            _ = forecast_tick.tick() => {
+                forecast_fetch(&client, &db, &bot, admin_chat_id).await;
+            }
+            _ = cleanup_tick.tick() => {
                 if let Err(e) = db.cleanup_old_records() {
                     tracing::error!(error=%e, "DB cleanup failed");
                 } else {
@@ -67,42 +57,6 @@ pub async fn run(db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
                 }
             }
         }
-    }
-}
-
-// ── Aligned fetch loops ──────────────────────────────────────────────
-
-/// Wait until 2.5min after the next 5-min boundary, then fetch.
-/// No SETTLEMENTDATE validation — accept whatever AEMO returns.
-/// Data freshness is shown to users via the "(X min ago)" indicator.
-async fn price_fetch_loop(client: reqwest::Client, db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(300));
-    // Align to AEMO's 5-min cycle: wait 150s after the nearest boundary
-    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
-    let min = now.minute() as u64;
-    let sec = now.second() as u64;
-    let into_cycle = (min % 5) * 60 + sec;
-    let first_wait = if into_cycle < 150 { 150 - into_cycle } else { 300 + 150 - into_cycle };
-    tokio::time::sleep(Duration::from_secs(first_wait)).await;
-
-    loop {
-        fetch_prices(&client, &db, &bot, admin_chat_id).await;
-        interval.tick().await;
-    }
-}
-
-async fn forecast_fetch_loop(client: reqwest::Client, db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1800));
-    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
-    let min = now.minute() as u64;
-    let sec = now.second() as u64;
-    let into_cycle = (min % 30) * 60 + sec;
-    let first_wait = if into_cycle < 90 { 90 - into_cycle } else { 1800 + 90 - into_cycle };
-    tokio::time::sleep(Duration::from_secs(first_wait)).await;
-
-    loop {
-        forecast_fetch(&client, &db, &bot, admin_chat_id).await;
-        interval.tick().await;
     }
 }
 
