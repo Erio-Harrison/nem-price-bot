@@ -42,7 +42,7 @@ pub fn parse_dispatch(csv: &str) -> Vec<PriceRecord> {
                     let region = fields[ri].trim().trim_matches('"').to_string();
                     let price: f64 = fields[pi].trim().trim_matches('"').parse().unwrap_or(f64::NAN);
                     let time = fields[ti].trim().trim_matches('"').to_string();
-                    if price.is_finite() && price >= -1000.0 && price <= 17500.0 {
+                    if price.is_finite() && (-1000.0..=17500.0).contains(&price) {
                         records.push(PriceRecord { region, price, interval_time: time });
                     }
                 }
@@ -86,7 +86,7 @@ pub fn parse_predispatch(csv: &str) -> Vec<ForecastRecord> {
                     let region = fields[ri].trim().trim_matches('"').to_string();
                     let price: f64 = fields[pi].trim().trim_matches('"').parse().unwrap_or(f64::NAN);
                     let time = fields[ti].trim().trim_matches('"').to_string();
-                    if price.is_finite() && price >= -1000.0 && price <= 17500.0 {
+                    if price.is_finite() && (-1000.0..=17500.0).contains(&price) {
                         records.push(ForecastRecord { region, price, forecast_time: time });
                     }
                 }

@@ -108,7 +108,7 @@ async fn cmd_alert(bot: &Bot, msg: &Message, db: &Db, chat_id: i64, args: &str) 
         }
     };
 
-    let parts: Vec<&str> = args.trim().split_whitespace().collect();
+    let parts: Vec<&str> = args.split_whitespace().collect();
     let reply = match parts.as_slice() {
         ["high", val] => {
             let v: f64 = val.parse().map_err(|_| "Invalid number")?;
