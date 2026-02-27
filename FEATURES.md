@@ -2,7 +2,7 @@
 
 ## Architecture
 
-Single Rust binary, ~30MB memory, runs on a $3-5/month VPS.
+Single Rust binary, 14MB (Apple Silicon, rustc 1.93.0, release build). Runs on a $3-5/month VPS.
 
 ```
 AEMO Nemweb ──HTTP/CSV──> Scheduler ──> Analyzer ──> Notifier ──> Telegram
