@@ -18,8 +18,8 @@ pub async fn run(db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
 
     tracing::info!("Scheduler started, fetching initial data...");
 
-    // Fetch immediately on startup (no timestamp validation)
-    price_fetch_unchecked(&client, &db, &bot, admin_chat_id).await;
+    // Fetch immediately on startup
+    fetch_prices(&client, &db, &bot, admin_chat_id).await;
     forecast_fetch(&client, &db, &bot, admin_chat_id).await;
 
     // Spawn aligned price fetcher
@@ -70,144 +70,45 @@ pub async fn run(db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
     }
 }
 
-// ── AEMO clock alignment ──────────────────────────────────────────────
+// ── Aligned fetch loops ──────────────────────────────────────────────
 
-/// Duration to wait until next 5-min aligned fetch slot.
-/// Targets :01:30, :06:30, :11:30 ... (90 seconds after each 5-min boundary).
-/// This gives AEMO ~90s to publish the data after the interval ends.
-fn wait_until_next_price_slot() -> Duration {
-    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
-    let min = now.minute() as i64;
-    let sec = now.second() as i64;
-    let current_secs = min * 60 + sec;
-
-    let base = min - (min % 5);
-    let target_secs = base * 60 + 90; // 1min30s after interval boundary
-
-    let wait = if target_secs > current_secs {
-        target_secs - current_secs
-    } else {
-        target_secs + 300 - current_secs // next interval
-    };
-
-    Duration::from_secs(wait.max(1) as u64)
-}
-
-/// Duration to wait until next 30-min aligned forecast fetch slot.
-fn wait_until_next_forecast_slot() -> Duration {
-    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
-    let min = now.minute() as i64;
-    let sec = now.second() as i64;
-    let current_secs = min * 60 + sec;
-
-    let base = min - (min % 30);
-    let target_secs = base * 60 + 90;
-
-    let wait = if target_secs > current_secs {
-        target_secs - current_secs
-    } else {
-        target_secs + 1800 - current_secs
-    };
-
-    Duration::from_secs(wait.max(1) as u64)
-}
-
-/// Expected SETTLEMENTDATE for the current 5-min interval.
-/// AEMO SETTLEMENTDATE marks the END of the interval, i.e. the most recent
-/// 5-minute boundary. E.g. at 14:01:30 we expect "2026/02/27 14:00:00".
-fn expected_settlement_time() -> String {
-    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
-    let min = now.minute();
-    let base = min - (min % 5);
-    now.with_minute(base)
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap()
-        .format("%Y/%m/%d %H:%M:%S")
-        .to_string()
-}
-
-// ── Fetch loops ───────────────────────────────────────────────────────
-
-/// Aligned price fetch: wait for AEMO publish slot, fetch, validate
-/// SETTLEMENTDATE, retry up to 4 times if data is stale.
+/// Wait until 2.5min after the next 5-min boundary, then fetch.
+/// No SETTLEMENTDATE validation — accept whatever AEMO returns.
+/// Data freshness is shown to users via the "(X min ago)" indicator.
 async fn price_fetch_loop(client: reqwest::Client, db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    // Align to AEMO's 5-min cycle: wait 150s after the nearest boundary
+    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
+    let min = now.minute() as u64;
+    let sec = now.second() as u64;
+    let into_cycle = (min % 5) * 60 + sec;
+    let first_wait = if into_cycle < 150 { 150 - into_cycle } else { 300 + 150 - into_cycle };
+    tokio::time::sleep(Duration::from_secs(first_wait)).await;
+
     loop {
-        let wait = wait_until_next_price_slot();
-        tracing::debug!(wait_secs = wait.as_secs(), "Next price fetch in");
-        tokio::time::sleep(wait).await;
-
-        let expected = expected_settlement_time();
-        let mut success = false;
-
-        for attempt in 0..5u32 {
-            match price_fetch_checked(&client, &db, &bot, admin_chat_id, &expected).await {
-                FetchResult::Success => {
-                    success = true;
-                    break;
-                }
-                FetchResult::Stale => {
-                    tracing::debug!(attempt, expected=%expected, "Data not yet updated, retrying in 15s");
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                }
-                FetchResult::Error => break,
-            }
-        }
-
-        if !success {
-            tracing::warn!(expected=%expected, "Could not fetch current interval after retries");
-        }
+        fetch_prices(&client, &db, &bot, admin_chat_id).await;
+        interval.tick().await;
     }
 }
 
 async fn forecast_fetch_loop(client: reqwest::Client, db: Arc<Db>, bot: Bot, admin_chat_id: Option<i64>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1800));
+    let now = chrono::Utc::now().with_timezone(&chrono_tz::Australia::Brisbane);
+    let min = now.minute() as u64;
+    let sec = now.second() as u64;
+    let into_cycle = (min % 30) * 60 + sec;
+    let first_wait = if into_cycle < 90 { 90 - into_cycle } else { 1800 + 90 - into_cycle };
+    tokio::time::sleep(Duration::from_secs(first_wait)).await;
+
     loop {
-        let wait = wait_until_next_forecast_slot();
-        tracing::debug!(wait_secs = wait.as_secs(), "Next forecast fetch in");
-        tokio::time::sleep(wait).await;
         forecast_fetch(&client, &db, &bot, admin_chat_id).await;
+        interval.tick().await;
     }
 }
 
 // ── Fetch implementations ─────────────────────────────────────────────
 
-enum FetchResult {
-    Success,
-    Stale,
-    Error,
-}
-
-/// Fetch prices and validate SETTLEMENTDATE matches expected interval.
-async fn price_fetch_checked(
-    client: &reqwest::Client,
-    db: &Arc<Db>,
-    bot: &Bot,
-    admin_chat_id: Option<i64>,
-    expected_time: &str,
-) -> FetchResult {
-    match fetcher::fetch_dispatch(client).await {
-        Ok(prices) => {
-            if !prices.iter().any(|p| p.interval_time == expected_time) {
-                return FetchResult::Stale;
-            }
-            tracing::info!(count = prices.len(), interval=%expected_time, "Fetched aligned prices");
-            process_prices(db, bot, &prices).await;
-            FetchResult::Success
-        }
-        Err(e) => {
-            tracing::error!(error=%e, "Dispatch fetch failed");
-            if let Some(admin) = admin_chat_id {
-                let _ = bot
-                    .send_message(ChatId(admin), format!("\u{26a0}\u{fe0f} Dispatch fetch failed\n{e}"))
-                    .await;
-            }
-            FetchResult::Error
-        }
-    }
-}
-
-/// Fetch prices without timestamp validation (used on startup).
-async fn price_fetch_unchecked(
+async fn fetch_prices(
     client: &reqwest::Client,
     db: &Arc<Db>,
     bot: &Bot,
@@ -215,14 +116,14 @@ async fn price_fetch_unchecked(
 ) {
     match fetcher::fetch_dispatch(client).await {
         Ok(prices) => {
-            tracing::info!(count = prices.len(), "Initial price fetch");
+            tracing::info!(count = prices.len(), "Fetched dispatch prices");
             process_prices(db, bot, &prices).await;
         }
         Err(e) => {
-            tracing::error!(error=%e, "Initial dispatch fetch failed");
+            tracing::error!(error=%e, "Dispatch fetch failed");
             if let Some(admin) = admin_chat_id {
                 let _ = bot
-                    .send_message(ChatId(admin), format!("\u{26a0}\u{fe0f} Startup fetch failed\n{e}"))
+                    .send_message(ChatId(admin), format!("\u{26a0}\u{fe0f} Dispatch fetch failed\n{e}"))
                     .await;
             }
         }
